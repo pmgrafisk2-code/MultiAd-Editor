@@ -1,0 +1,3243 @@
+<script>
+const APP_URL='https://multiad.webflow.io/collection-details-api';
+const SYSTEM_FIELDS=['_archived','_draft'];
+
+const REF_SCOPE_FIELD_SLUG = 'hvilken-multiad-skal-det-brukes-i'; 
+window.refMetaCache = window.refMetaCache || {};
+
+
+const IMG_MAX_KB    = 50;
+const IMG_MAX_BYTES = IMG_MAX_KB * 1024;
+
+function qs(sel){return document.querySelector(sel);}
+function el(tag,attrs={},children=[]){
+  const node=document.createElement(tag);
+  Object.entries(attrs).forEach(([k,v])=>{
+    if(k==='text')node.textContent=v;
+    else if(k==='class')node.className=v;
+    else node.setAttribute(k,v);
+  });
+  children.forEach(c=>node.appendChild(c));
+  return node;
+}
+
+function addHelp(field,wrapper){
+  if(field && field.helpText){
+    wrapper.appendChild(
+      el('div',{
+        class:`cms-field-help cms-field-help--slug-${field.slug}`,
+        text:field.helpText
+      })
+    );
+  }
+}
+
+const PREFS_STORAGE_KEY_PREFIX = 'multiad_cms_editor_prefs_';
+
+let currentDragColKey = null;
+let suppressNextHeaderClick = false;
+
+function getPrefsStorageKey() {
+  const cid = state.collectionId || getCollectionIdFromAttribute() || 'default';
+  return PREFS_STORAGE_KEY_PREFIX + cid;
+}
+
+function saveEditorPrefs() {
+  try {
+    const key = getPrefsStorageKey();
+    const payload = {
+      pinnedFields: state.pinnedFields,
+      sortKey: state.sortKey,
+      sortDir: state.sortDir
+    };
+    localStorage.setItem(key, JSON.stringify(payload));
+  } catch (e) {
+    console.warn('Could not save editor prefs', e);
+  }
+}
+
+function loadEditorPrefs() {
+  try {
+    const raw = localStorage.getItem(getPrefsStorageKey());
+    if (!raw) return;
+    const prefs = JSON.parse(raw);
+
+    if (prefs && Array.isArray(prefs.pinnedFields)) {
+      const fieldsMeta = state.collectionDetails?.fields || [];
+      const validSlugs = new Set(fieldsMeta.map(f => f.slug));
+      validSlugs.add('__metaCreated');
+      validSlugs.add('__metaPublished');
+
+      const pins = [];
+
+      pins.push('name');
+      pins.push('status');
+
+      prefs.pinnedFields.forEach(slug => {
+        if (!slug || slug === 'name' || slug === 'status') return;
+        if (!validSlugs.has(slug)) return;
+        if (!pins.includes(slug)) pins.push(slug);
+      });
+
+      state.pinnedFields = pins;
+    }
+
+    if (prefs && typeof prefs.sortKey === 'string') {
+      state.sortKey = prefs.sortKey;
+    }
+    if (prefs && (prefs.sortDir === 'asc' || prefs.sortDir === 'desc')) {
+      state.sortDir = prefs.sortDir;
+    }
+  } catch (e) {
+    console.warn('Could not load editor prefs', e);
+  }
+}
+
+
+function refreshIframes(){
+  const DELAY=1500;
+  setTimeout(()=>{
+    const now=Date.now().toString();
+    document.querySelectorAll('iframe').forEach(f=>{
+      const src=f.getAttribute('src');
+      if(!src)return;
+      try{
+        const u=new URL(src,window.location.href);
+        u.searchParams.set('_cb',now);
+        f.src=u.toString();
+      }catch{
+        const sep=src.indexOf('?')===-1?'?':'&';
+        f.src=src+sep+'_cb='+now;
+      }
+    });
+  },DELAY);
+}
+
+function setStatus(msg,isError=false){
+  const box=qs('#editor-status');
+  if(!box)return;
+  box.textContent=msg||'';
+  box.style.color=isError?'#b00020':'#ffffff';
+}
+
+function getCollectionIdFromAttribute(){
+  const el=document.querySelector('#collection-id');
+  if(!el)return null;
+  return el.getAttribute('collection-id');
+}
+
+function normalizeColorToHex(str){
+  if(!str)return null;
+  str=String(str).trim();
+  if(!str)return null;
+
+  let m=str.match(/^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/);
+  if(m){
+    let hex=m[1];
+    if(hex.length===3){
+      hex=hex.split('').map(ch=>ch+ch).join('');
+    }
+    return '#'+hex.toLowerCase();
+  }
+
+  let ctx=normalizeColorToHex._ctx;
+  if(!ctx){
+    const c=document.createElement('canvas');
+    c.width=c.height=1;
+    ctx=c.getContext('2d');
+    normalizeColorToHex._ctx=ctx;
+  }
+
+  try{
+    ctx.fillStyle='#000000';
+    ctx.fillStyle=str;
+  }catch{
+    return null;
+  }
+
+  const computed=ctx.fillStyle;
+
+  m=computed.match(/^#([0-9a-fA-F]{6})$/);
+  if(m)return '#'+m[1].toLowerCase();
+
+  m=computed.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+  if(m){
+    const clamp255=n=>Math.max(0,Math.min(255,parseInt(n,10)));
+    const r=clamp255(m[1]);
+    const g=clamp255(m[2]);
+    const b=clamp255(m[3]);
+    const toHex=n=>n.toString(16).padStart(2,'0');
+    return '#'+toHex(r)+toHex(g)+toHex(b);
+  }
+  return null;
+}
+
+const state = {
+  collectionId: null,
+  collectionDetails: null,
+  fieldsBySlug: {},
+  items: [],
+  currentItem: null,
+  isNew: false,
+  selectedItemIds: new Set(),
+  searchQuery: '',
+  statusFilter: 'all',
+  sortKey: 'name',
+  sortDir: 'asc',
+  pinnedFields: ['name', 'status'],
+  pendingImages: new Map(),
+};
+
+
+const BUILTIN_COLS = [
+  { key: 'name',   label: 'Navn',   kind: 'builtin' },
+  { key: 'status', label: 'Status', kind: 'builtin' },
+];
+
+
+
+function getPinnedExtraFields() {
+  return state.pinnedFields.filter(slug => slug !== 'name' && slug !== 'status');
+}
+
+
+
+function getActiveColumns() {
+  const extra = (state.pinnedFields || [])
+    .map(slug => {
+      const f = state.fieldsBySlug[slug];
+      if (!f) return null;
+      return {
+        key: slug,
+        label: f.displayName || f.name || slug,
+        kind: 'field',
+        field: f,
+      };
+    })
+    .filter(Boolean);
+
+  return [...BUILTIN_COLS, ...extra];
+}
+
+
+function updateEditorButtons(){
+  const saveBtn=qs('#save-item-btn');
+  const publishItemBtn=qs('#publish-item-btn');
+  const unpublishItemBtn=qs('#unpublish-item-btn');
+  const deleteItemBtn=qs('#delete-item-btn');
+
+  const hasItem=!!state.currentItem;
+  const hasSavedItem=hasItem && !state.isNew;
+
+  if(saveBtn){
+    saveBtn.disabled=!hasItem;
+    saveBtn.classList.toggle('disabled',saveBtn.disabled);
+  }
+
+  let isPublished=false;
+  if(hasSavedItem && state.currentItem){
+    try{
+      isPublished=!!deriveItemStatus(state.currentItem).published;
+    }catch{}
+  }
+
+  if(publishItemBtn){
+    publishItemBtn.disabled=!hasSavedItem;
+    publishItemBtn.classList.toggle('disabled',publishItemBtn.disabled);
+  }
+  if(unpublishItemBtn){
+    unpublishItemBtn.disabled=!hasSavedItem;
+    unpublishItemBtn.classList.toggle('disabled',unpublishItemBtn.disabled);
+  }
+  if(deleteItemBtn){
+    deleteItemBtn.disabled=!hasSavedItem;
+    deleteItemBtn.classList.toggle('disabled',deleteItemBtn.disabled);
+  }
+
+  if(publishItemBtn && unpublishItemBtn){
+    if(!hasSavedItem){
+      publishItemBtn.style.display='inline-block';
+      unpublishItemBtn.style.display='none';
+    }else if(isPublished){
+      publishItemBtn.style.display='none';
+      unpublishItemBtn.style.display='inline-block';
+    }else{
+      publishItemBtn.style.display='inline-block';
+      unpublishItemBtn.style.display='none';
+    }
+  }
+}
+
+function createImageFieldControl(field,value){
+  const key=field.slug;
+  const wrapper=el("div",{
+    class:`cms-field cms-field--type-Image cms-field--slug-${key}`
+  });
+
+  const label=el("label",{
+    class:"cms-field-label"
+  },[document.createTextNode(field.displayName||field.name||key)]);
+
+  let meta={fileId:null,url:"",alt:"",displayName:""};
+
+  if(value && typeof value==="object"){
+    meta.fileId=value.fileId||value.id||null;
+    meta.url=value.url||(value.file && value.file.url)||"";
+    meta.alt=value.alt||"";
+    meta.displayName=value.displayName||value.originalFileName||"";
+  }
+
+  const metaInput=el("input",{
+    type:"hidden",
+    "data-field-key":key,
+    "data-image-json":"true",
+    value:JSON.stringify(meta)
+  });
+
+  const fileInput=el("input",{
+    type:"file",
+    accept:"image/*",
+    class:"cms-input--image-file"
+  });
+
+  const dropzone=el("div",{class:"cms-img-dropzone"});
+
+  const img=el("img",{
+    class:"cms-img-preview",
+    style:"display:none;"
+  });
+
+  const placeholderEl=el("div",{
+    class:"cms-img-placeholder",
+    text:"Klikk eller dra bilde hit"
+  });
+
+  const filenameEl=el("div",{
+    class:"cms-img-filename",
+    text:""
+  });
+
+  const clearBtn=el("button",{
+    type:"button",
+    class:"cms-img-clear-btn cms-img-clear-below"
+  },[document.createTextNode("Fjern bilde")]);
+
+  function deriveFilename(url){
+    if(!url)return "";
+    try{
+      const clean=url.split("?")[0];
+      return clean.split("/").pop()||"";
+    }catch{
+      return "";
+    }
+  }
+
+  function syncUI(){
+    const previewSrc=meta.previewUrl||meta.url;
+
+    if(previewSrc){
+      img.src=previewSrc;
+      img.style.display="block";
+      placeholderEl.style.display="none";
+    }else{
+      img.src="";
+      img.style.display="none";
+      placeholderEl.style.display="block";
+    }
+
+    filenameEl.textContent=
+      meta.displayName||
+      meta.fileName||
+      deriveFilename(meta.url)||
+      "";
+
+    metaInput.value=JSON.stringify(meta);
+  }
+
+  async function handleNewFile(file){
+    if(!file)return;
+    if(!file.type.startsWith("image/")){
+      alert("Vennligst velg en bildefil");
+      return;
+    }
+    try{
+      setStatus("Komprimerer bilde…");
+      const compressed=await compressImageToWebp(file,IMG_MAX_BYTES);
+
+      if(meta.previewUrl){
+        try{URL.revokeObjectURL(meta.previewUrl);}catch{}
+      }
+
+      const previewUrl=URL.createObjectURL(compressed);
+      state.pendingImages.set(key,{file:compressed,previewUrl});
+
+      meta={
+        fileId:null,
+        url:"",
+        alt:"",
+        displayName:"",
+        fileName:compressed.name,
+        previewUrl,
+        pendingUpload:true
+      };
+
+      syncUI();
+      setStatus("Bilde komprimert og klart til lagring");
+    }catch(err){
+      console.error("Compression failed",err);
+      setStatus("Kunne ikke komprimere bilde",true);
+    }
+  }
+
+  dropzone.addEventListener("click",()=>fileInput.click());
+
+  dropzone.addEventListener("dragover",e=>{
+    e.preventDefault();
+    dropzone.classList.add("drag-over");
+  });
+
+  dropzone.addEventListener("dragleave",e=>{
+    e.preventDefault();
+    dropzone.classList.remove("drag-over");
+  });
+
+  dropzone.addEventListener("drop",e=>{
+    e.preventDefault();
+    dropzone.classList.remove("drag-over");
+    const file=e.dataTransfer.files[0];
+    handleNewFile(file);
+  });
+
+  fileInput.addEventListener("change",()=>handleNewFile(fileInput.files[0]));
+
+  clearBtn.addEventListener("click",()=>{
+    meta={fileId:null,url:"",alt:"",displayName:""};
+    syncUI();
+  });
+
+  syncUI();
+
+  dropzone.appendChild(img);
+  dropzone.appendChild(placeholderEl);
+  dropzone.appendChild(filenameEl);
+
+  wrapper.appendChild(label);
+  wrapper.appendChild(dropzone);
+  wrapper.appendChild(clearBtn);
+  wrapper.appendChild(fileInput);
+  wrapper.appendChild(metaInput);
+  addHelp(field,wrapper);
+
+  return wrapper;
+}
+
+
+
+
+function createMultiImageFieldControl(field,value){
+  const key=field.slug;
+  const wrapper=el('div',{
+    class:`cms-field cms-field--type-MultiImage cms-field--slug-${key}`
+  });
+
+  const label=el('label',{class:'cms-field-label'},[
+    document.createTextNode(field.displayName||field.name||key)
+  ]);
+
+  let images=[];
+  if(Array.isArray(value)){
+    images=value.map(v=>({
+      fileId:v.fileId||v.id||(v.file && v.file.id)||null,
+      url:v.url||(v.file && v.file.url)||'',
+      alt:v.alt||v.displayName||''
+    })).filter(m=>m.url);
+  }
+
+  const list=el('div',{class:'cms-multiimg-list'});
+  const dropzone=el('div',{class:'cms-img-dropzone'});
+  const placeholderEl=el('div',{
+    class:'cms-img-placeholder',
+    text:'Klikk eller dra bilder hit'
+  });
+
+  const fileInput=el('input',{
+    type:'file',
+    accept:'image/*',
+    multiple:'multiple',
+    class:'cms-input cms-input--multiimage-file',
+    style:'display:none;'
+  });
+
+  const metaInput=el('input',{
+    type:'hidden',
+    'data-field-key':key,
+    'data-multi-image-json':'true',
+    class:'cms-input cms-input--multiimage-meta',
+    value:JSON.stringify(images)
+  });
+
+  function renderThumbs(){
+    list.innerHTML='';
+    if(!images.length){
+      list.classList.add('empty');
+      return;
+    }
+    list.classList.remove('empty');
+
+    images.forEach((imgMeta,idx)=>{
+      const item=el('div',{class:'cms-multiimg-item'});
+      const imgEl=el('img',{
+        class:'cms-img-preview cms-multiimg-thumb',
+        src:imgMeta.url
+      });
+      const removeBtn=el('button',{
+        type:'button',
+        class:'cms-img-clear-btn cms-multiimg-remove-btn'
+      },[document.createTextNode('Fjern')]);
+
+      removeBtn.addEventListener('click',()=>{
+        images.splice(idx,1);
+        metaInput.value=JSON.stringify(images);
+        renderThumbs();
+      });
+
+      item.appendChild(imgEl);
+      item.appendChild(removeBtn);
+      list.appendChild(item);
+    });
+  }
+
+  async function handleFiles(fileList){
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+
+  for (const file of files) {
+    if (!file.type || !file.type.startsWith('image/')) continue;
+
+    try {
+      setStatus('Komprimerer og laster opp bilder…');
+
+      const compressed = await compressImageToWebp(file, IMG_MAX_BYTES);
+
+      const asset = await apiUploadAsset(compressed);
+
+      images.push({
+        fileId: asset.id || null,
+        url: asset.url || '',
+        alt: ''
+      });
+    } catch (err) {
+      console.error('Multi-image upload failed:', err);
+      setStatus('En eller flere bilder feilet ved opplasting', true);
+    }
+  }
+
+  metaInput.value = JSON.stringify(images);
+  renderThumbs();
+  setStatus('Bilder lastet opp');
+}
+
+
+  dropzone.addEventListener('click',()=>fileInput.click());
+
+  dropzone.addEventListener('dragover',e=>{
+    e.preventDefault();
+    dropzone.classList.add('drag-over');
+  });
+
+  dropzone.addEventListener('dragleave',e=>{
+    e.preventDefault();
+    dropzone.classList.remove('drag-over');
+  });
+
+  dropzone.addEventListener('drop',e=>{
+    e.preventDefault();
+    dropzone.classList.remove('drag-over');
+    handleFiles(e.dataTransfer && e.dataTransfer.files);
+  });
+
+  fileInput.addEventListener('change',()=>{
+    handleFiles(fileInput.files);
+  });
+
+  dropzone.appendChild(placeholderEl);
+  wrapper.appendChild(label);
+  wrapper.appendChild(list);
+  wrapper.appendChild(dropzone);
+  wrapper.appendChild(fileInput);
+  wrapper.appendChild(metaInput);
+  addHelp(field,wrapper);
+
+  renderThumbs();
+  return wrapper;
+}
+
+function deriveItemStatus(item){
+  if(!item)return{published:false,label:'Inaktiv'};
+
+  const fd=item.fieldData||{};
+
+  const isArchived=
+    item.isArchived===true||
+    fd._archived===true||
+    fd._archived==='true';
+
+  const lastPubRaw=
+    item.lastPublished||
+    item.lastPublishedOn||
+    item.publishedOn||
+    null;
+
+  const lastUpdatedRaw=
+    item.lastUpdated||
+    item.updatedOn||
+    item.modifiedOn||
+    null;
+
+  const hasLive=!!lastPubRaw && !isArchived;
+
+  let hasDraftChanges=false;
+  if(hasLive && lastUpdatedRaw && lastPubRaw){
+    const u=new Date(lastUpdatedRaw);
+    const p=new Date(lastPubRaw);
+    if(!Number.isNaN(u.getTime()) && !Number.isNaN(p.getTime())){
+      const EPS=500;
+      hasDraftChanges=(u.getTime()-p.getTime())>EPS;
+    }
+  }
+
+  let label;
+  if(isArchived){
+    label=hasLive?'Arkivert (var aktivert)':'Arkivert';
+  }else if(hasLive && hasDraftChanges){
+    label='Aktiv';
+  }else if(hasLive){
+    label='Aktiv';
+  }else{
+    label='Inaktiv';
+  }
+
+  return{published:hasLive,label};
+}
+
+function getDefaultValueForField(field){
+  const t=field.type;
+  if(t==='Bool'||t==='Switch')return false;
+  if(t==='Number')return null;
+  if(t==='ImageRef'||t==='Image')return null;
+  if(t==='MultiImage'||t==='MultiReference')return[];
+  if(
+    t==='PlainText'||t==='RichText'||t==='Color'||
+    t==='Url'||t==='Email'||t==='Phone'||
+    t==='Slug'||t==='Link'||t==='VideoLink'
+  )return '';
+  if(t==='Date'||t==='DateTime')return '';
+  if(t==='Option'||t==='Reference')return '';
+  return '';
+}
+
+function createFieldInput(field,key,value){
+  const t=field.type;
+  const v=field.validations||{};
+  const typeClass=`cms-input--type-${t}`;
+  const slugClass=`cms-input--slug-${key}`;
+  const baseClass=`cms-input ${typeClass} ${slugClass}`;
+
+  let input;
+
+  if(t==="PlainText" && v.singleLine===false){
+    const textarea=el("textarea",{
+      "data-field-key":key,
+      rows:"3",
+      class:`${baseClass} cms-input--textarea`
+    });
+    textarea.value=value==null?"":value;
+    applyCommonValidations(field,textarea);
+    return textarea;
+  }
+
+  if(t==="RichText"){
+    const textarea=el("textarea",{
+      "data-field-key":key,
+      rows:"5",
+      class:`${baseClass} cms-input--richtext`
+    });
+    textarea.value=value==null?"":value;
+    applyCommonValidations(field,textarea);
+    return textarea;
+  }
+
+  if(t==="Bool"||t==="Switch"){
+    const labelWrap=el("label",{
+      class:"w-checkbox checkbox-field-12 cms-bool-wrap"
+    });
+
+    const visual=el("div",{
+      class:"w-checkbox-input w-checkbox-input--inputType-custom cms-input--bool test"
+    });
+
+    const real=el("input",{
+      type:"checkbox",
+      "data-field-key":key,
+      style:"opacity:0;position:absolute;z-index:-1;"
+    });
+    real.checked=!!value;
+
+    const innerLabel=el("span",{
+      class:"checkbox-label-2 w-form-label"
+    });
+
+    function syncVisual(){
+      if(real.checked)visual.classList.add("w--redirected-checked");
+      else visual.classList.remove("w--redirected-checked");
+    }
+
+    labelWrap.addEventListener("click",e=>{
+      if(e.target===real)return;
+      e.preventDefault();
+      real.checked=!real.checked;
+      syncVisual();
+    });
+
+    real.addEventListener("change",syncVisual);
+    syncVisual();
+
+    labelWrap.appendChild(visual);
+    labelWrap.appendChild(real);
+    labelWrap.appendChild(innerLabel);
+
+    applyCommonValidations(field,real);
+    return labelWrap;
+  }
+
+  if(t==="Number"){
+    input=el("input",{
+      type:"number",
+      "data-field-key":key,
+      value:value==null?"":value,
+      class:`${baseClass} cms-input--number`
+    });
+    applyCommonValidations(field,input);
+    return input;
+  }
+
+  if(t==="Color"){
+    let hex=normalizeColorToHex(value)||"#ffffff";
+
+    const wrapper=el("div",{
+      class:`cms-color-control cms-color-control--slug-${key}`
+    });
+
+    const hiddenPicker=el("input",{
+      type:"color",
+      value:hex,
+      class:"cms-color-picker-hidden"
+    });
+
+    const swatch=el("button",{
+      type:"button",
+      class:"cms-color-swatch"
+    });
+    swatch.style.backgroundColor=hex;
+
+    const textInput=el("input",{
+      type:"text",
+      "data-field-key":key,
+      class:`${baseClass} cms-input--color-text`,
+      value:hex,
+      placeholder:"#703333, rgb(112,51,51), red …"
+    });
+
+    function applyColor(c){
+      const n=normalizeColorToHex(c);
+      if(!n)return;
+      swatch.style.backgroundColor=n;
+      hiddenPicker.value=n;
+      textInput.value=n;
+    }
+
+    swatch.addEventListener("click",()=>hiddenPicker.click());
+    hiddenPicker.addEventListener("input",()=>applyColor(hiddenPicker.value));
+    textInput.addEventListener("input",()=>{
+      const n=normalizeColorToHex(textInput.value);
+      if(n)swatch.style.backgroundColor=n;
+    });
+
+    applyCommonValidations(field,textInput);
+
+    wrapper.appendChild(hiddenPicker);
+    wrapper.appendChild(swatch);
+    wrapper.appendChild(textInput);
+    return wrapper;
+  }
+
+  if(t==="Date"||t==="DateTime"){
+    const includeTime=(t==="DateTime" && v.format==="date-time");
+    let inputVal="";
+
+    if(value){
+      const d=new Date(value);
+      if(!Number.isNaN(d.getTime())){
+        const pad=n=>String(n).padStart(2,"0");
+        const yyyy=d.getFullYear();
+        const mm=pad(d.getMonth()+1);
+        const dd=pad(d.getDate());
+        if(includeTime){
+          const hh=pad(d.getHours());
+          const mi=pad(d.getMinutes());
+          inputVal=`${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+        }else{
+          inputVal=`${yyyy}-${mm}-${dd}`;
+        }
+      }else{
+        inputVal=value;
+      }
+    }
+
+    input=el("input",{
+      type:includeTime?"datetime-local":"date",
+      "data-field-key":key,
+      value:inputVal,
+      class:`${baseClass} cms-input--date`
+    });
+    applyCommonValidations(field,input);
+    return input;
+  }
+
+  if(t==="Email"){
+    input=el("input",{
+      type:"email",
+      "data-field-key":key,
+      value:value==null?"":value,
+      class:`${baseClass} cms-input--email`
+    });
+    applyCommonValidations(field,input);
+    return input;
+  }
+
+  if(t==="Url"||t==="Link"||t==="VideoLink"){
+    input=el("input",{
+      type:"url",
+      "data-field-key":key,
+      value:value==null?"":value,
+      class:`${baseClass} cms-input--url cms-input--${t.toLowerCase()}`
+    });
+    applyCommonValidations(field,input);
+    return input;
+  }
+
+  if(t==="Phone"){
+    input=el("input",{
+      type:"tel",
+      "data-field-key":key,
+      value:value==null?"":value,
+      class:`${baseClass} cms-input--phone`
+    });
+    applyCommonValidations(field,input);
+    return input;
+  }
+
+  if(t==="Option"){
+    const optionsFromField=field.options;
+    const optionsFromValidations=(v && Array.isArray(v.options))?v.options:null;
+    const options=optionsFromField||optionsFromValidations||[];
+
+    const select=el("select",{
+      "data-field-key":key,
+      class:`${baseClass} cms-input--select`
+    });
+
+    options.forEach(opt=>{
+      const val=opt.slug||opt.id||opt.value||opt.name||"";
+      const name=opt.name||opt.label||val;
+      const option=el("option",{value:val},[document.createTextNode(name)]);
+      if(value===val)option.selected=true;
+      select.appendChild(option);
+    });
+
+    applyCommonValidations(field,select);
+    return select;
+  }
+
+  if(t==="Reference"){
+    const select=el("select",{
+      "data-field-key":key,
+      class:`${baseClass} cms-input--reference`
+    });
+
+    const placeholder=el("option",{
+      disabled:"disabled",
+      value:""
+    },[document.createTextNode("Laster alternativer…")]);
+    select.appendChild(placeholder);
+
+    const collectionId=v.collectionId||v.collection||v.collectionSlug;
+    loadReferenceOptions(collectionId,select,value,false);
+
+    applyCommonValidations(field,select);
+    return select;
+  }
+
+  if(t==="MultiReference"){
+    const wrapper=el("div",{
+      class:`${baseClass} cms-mref-wrapper`
+    });
+
+    const select=el("select",{
+      "data-field-key":key,
+      multiple:"multiple",
+      class:"cms-mref-select",
+      style:"display:none;"
+    });
+
+    const optionsHost=el("div",{class:"cms-mref-options"});
+    const chipsHost=el("div",{class:"cms-mref-chips"});
+
+    const collectionId=v.collectionId||v.collection||v.collectionSlug;
+
+    loadReferenceOptions(collectionId,select,value,true,{
+      optionsHost,
+      chipsHost
+    });
+
+    wrapper.appendChild(optionsHost);
+    wrapper.appendChild(chipsHost);
+    wrapper.appendChild(select);
+
+    applyCommonValidations(field,select);
+    return wrapper;
+  }
+
+  input=el("input",{
+    type:"text",
+    "data-field-key":key,
+    value:value==null?"":value,
+    class:`${baseClass} cms-input--text`
+  });
+  applyCommonValidations(field,input);
+  return input;
+}
+
+function getSortValue(item, key) {
+  const fd = item.fieldData || {};
+
+  if (key === 'name') {
+    return (fd.name || '').toString().toLowerCase();
+  }
+  if (key === 'status') {
+    return deriveItemStatus(item).label.toLowerCase();
+  }
+  if (key === 'created') {
+    return new Date(item.createdOn || 0).getTime();
+  }
+  if (key === 'updated') {
+    return new Date(
+      item.lastUpdated || item.updatedOn || item.modifiedOn || item.createdOn || 0
+    ).getTime();
+  }
+
+  if (key === '__metaCreated') {
+    const t = new Date(
+      item.createdOn || item.created || item.createdAt || 0
+    ).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  if (key === '__metaPublished') {
+    const t = new Date(
+      item.lastPublished ||
+      item.lastPublishedOn ||
+      item.publishedOn ||
+      0
+    ).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  // --- Generic: treat key as a real field slug ---
+  const def = state.fieldsBySlug && state.fieldsBySlug[key];
+  const raw = fd[key];
+
+  if (!def) {
+    return (raw == null ? '' : String(raw)).toLowerCase();
+  }
+
+  if (def.type === 'Number') {
+    const n = Number(raw);
+    return Number.isNaN(n) ? 0 : n;
+  }
+
+  if (def.type === 'Bool' || def.type === 'Switch') {
+    return raw ? 1 : 0;
+  }
+
+  if (def.type === 'Date' || def.type === 'DateTime') {
+    const t = new Date(raw || 0).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  return (raw == null ? '' : String(raw)).toLowerCase();
+}
+
+
+
+function getVisibleItems(){
+  let items=state.items.slice();
+
+  const q=(state.searchQuery||'').trim().toLowerCase();
+  if(q){
+    items=items.filter(item=>{
+      const fd=item.fieldData||{};
+      const name=(fd.name||'').toString().toLowerCase();
+      const slug=(fd.slug||'').toString().toLowerCase();
+      const id=(item.id||'').toString().toLowerCase();
+      return(
+        name.includes(q)||
+        slug.includes(q)||
+        id.includes(q)
+      );
+    });
+  }
+
+  if(state.statusFilter!=='all'){
+    items=items.filter(item=>{
+      const info=deriveItemStatus(item);
+      if(state.statusFilter==='active')return info.published;
+      if(state.statusFilter==='inactive')return !info.published;
+      return true;
+    });
+  }
+
+   const key = state.sortKey;
+  const dir = state.sortDir === 'desc' ? -1 : 1;
+
+  items.sort((a, b) => {
+    const va = getSortValue(a, key);
+    const vb = getSortValue(b, key);
+
+    if (va < vb) return -1 * dir;
+    if (va > vb) return  1 * dir;
+    return 0;
+  });
+
+  return items;
+}
+
+
+
+
+function formatFieldValueShort(val, field) {
+  if (val == null) return '';
+  if (Array.isArray(val)) return val.length + ' stk';
+  if (field && (field.type === 'Reference' || field.type === 'MultiReference')) {
+    return '(referanse)';
+  }
+  if (field && field.type === 'Bool') {
+    return val ? 'Ja' : 'Nei';
+  }
+  if (field && (field.type === 'Date' || field.type === 'DateTime')) {
+    const d = new Date(val);
+    if (!Number.isNaN(d.getTime())) return d.toLocaleDateString('nb-NO');
+  }
+  return String(val);
+}
+
+function renderItemsHeader() {
+  const headerEl = qs('#items-header');
+  const table    = qs('#items-table');
+  if (!headerEl || !table) return;
+
+  headerEl.innerHTML = '';
+
+  const extra = getPinnedExtraFields();
+  const extraCount = extra.length;
+
+  table.style.setProperty('--cms-extra-cols', String(extraCount));
+  table.classList.toggle('has-extra-cols', extraCount > 0);
+
+    function addHeaderCell(slug, label, sortKey, opts = {}) {
+    const classes = ['items-header-cell'];
+    if (sortKey) classes.push('items-header-cell--sortable');
+    if (opts.draggable) classes.push('items-header-cell--draggable');
+
+    const cell = el('div', {
+      class: classes.join(' '),
+      'data-sort-key': sortKey || '',
+      'data-col-key': slug || ''
+    }, [
+      opts.draggable
+        ? el('span', { class: 'items-header-drag-handle', text: '⋮⋮' })
+        : document.createTextNode(''),
+      document.createTextNode(label)
+    ]);
+
+    if (opts.draggable) {
+      cell.setAttribute('draggable', 'true');
+    }
+
+    if (sortKey && state.sortKey === sortKey) {
+      cell.setAttribute('data-sort-dir', state.sortDir);
+    } else {
+      cell.removeAttribute('data-sort-dir');
+    }
+
+    headerEl.appendChild(cell);
+  }
+
+
+  addHeaderCell('name',   'Navn',   'name',   { draggable: false });
+  addHeaderCell('status', 'Status', 'status', { draggable: false });
+
+  extra.forEach(slug => {
+    let label;
+
+    if (slug === '__metaCreated') {
+      label = 'Opprettet';
+    } else if (slug === '__metaPublished') {
+      label = 'Sist publisert';
+    } else {
+      const f = state.fieldsBySlug[slug];
+      label = (f && (f.displayName || f.name)) || slug;
+    }
+
+    addHeaderCell(slug, label, slug, { draggable: true });
+  });
+
+
+
+    // --- drag & drop for extra columns ---
+  headerEl.ondragstart = (e) => {
+    const cell = e.target.closest('.items-header-cell--draggable');
+    if (!cell) return;
+    const colKey = cell.getAttribute('data-col-key');
+    if (!colKey) return;
+
+    currentDragColKey = colKey;
+    suppressNextHeaderClick = true;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', colKey); } catch {}
+    }
+  };
+
+  headerEl.ondragover = (e) => {
+    const cell = e.target.closest('.items-header-cell--draggable');
+    if (!cell) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  };
+
+  headerEl.ondrop = (e) => {
+    const targetCell = e.target.closest('.items-header-cell--draggable');
+    if (!targetCell || !currentDragColKey) return;
+    e.preventDefault();
+
+    const targetKey = targetCell.getAttribute('data-col-key');
+    if (!targetKey || targetKey === currentDragColKey) {
+      currentDragColKey = null;
+      return;
+    }
+
+    const base = state.pinnedFields.filter(k => k === 'name' || k === 'status');
+    const extras = state.pinnedFields.filter(k => k !== 'name' && k !== 'status');
+
+    const fromIdx = extras.indexOf(currentDragColKey);
+    const toIdx   = extras.indexOf(targetKey);
+
+    if (fromIdx === -1 || toIdx === -1) {
+      currentDragColKey = null;
+      return;
+    }
+
+    const [moved] = extras.splice(fromIdx, 1);
+    extras.splice(toIdx, 0, moved);
+
+    state.pinnedFields = [...base, ...extras];
+
+    currentDragColKey = null;
+
+    renderItemsHeader();
+    renderItemsList();
+    saveEditorPrefs();
+  };
+
+  headerEl.ondragend = () => {
+    currentDragColKey = null;
+    setTimeout(() => { suppressNextHeaderClick = false; }, 0);
+  };
+
+  headerEl.onclick = (e) => {
+    if (suppressNextHeaderClick) {
+      suppressNextHeaderClick = false;
+      return;
+    }
+
+    const cell = e.target.closest('.items-header-cell--sortable');
+    if (!cell) return;
+
+    const key = cell.getAttribute('data-sort-key') || 'name';
+
+    if (state.sortKey === key) {
+      state.sortDir = (state.sortDir === 'asc' ? 'desc' : 'asc');
+    } else {
+      state.sortKey = key;
+      state.sortDir = 'asc';
+    }
+
+    renderItemsHeader();
+    renderItemsList();
+    saveEditorPrefs();
+  };
+
+
+}
+
+
+function askConfirm(message) {
+  return new Promise((resolve) => {
+    const box = qs("#confirm-message");
+    const txt = qs("#confirm-txt");
+    const btnYes = qs("#confirm-yes");
+    const btnNo = qs("#confirm-no");
+
+    if (!box || !txt || !btnYes || !btnNo) {
+      console.warn("Custom confirm elements missing, falling back to browser confirm()");
+      resolve(confirm(message));
+      return;
+    }
+    txt.textContent = message;
+
+    box.classList.remove("hidden");
+
+    function cleanup() {
+      btnYes.removeEventListener("click", onYes);
+      btnNo.removeEventListener("click", onNo);
+      box.classList.add("hidden");
+    }
+
+    function onYes() {
+      cleanup();
+      resolve(true);
+    }
+
+    function onNo() {
+      cleanup();
+      resolve(false);
+    }
+
+    btnYes.addEventListener("click", onYes);
+    btnNo.addEventListener("click", onNo);
+  });
+}
+
+
+
+function resolveReferenceLabel(field, raw) {
+  if (!field || raw == null) return '';
+
+  let id = '';
+  if (typeof raw === 'string') {
+    id = raw;
+  } else if (raw && typeof raw === 'object') {
+    id = raw.id || raw._id || raw.value || '';
+  }
+  if (!id) return '';
+
+  const v = field.validations || {};
+  const refCollectionId = v.collectionId || v.collection || v.collectionSlug;
+  if (!refCollectionId) return id;
+
+  const cacheRoot =
+    (window.refOptionsCache && window.refOptionsCache[refCollectionId]) || null;
+  if (!cacheRoot) return id;
+
+  if (cacheRoot.labelById && cacheRoot.labelById[id]) {
+    return cacheRoot.labelById[id];
+  }
+
+  if (Array.isArray(cacheRoot.items)) {
+    const match = cacheRoot.items.find(it => it.id === id);
+    if (match) {
+      const fd = match.fieldData || {};
+      return (
+        fd.name ||
+        fd.title ||
+        fd.slug ||
+        match.id ||
+        id
+      );
+    }
+  }
+
+  return id;
+}
+
+
+
+function renderItemsList() {
+  const listEl   = qs('#items-list');
+  const template = qs('#list-item-template');
+  const selectAll = qs('#select-all-items');
+  if (!listEl || !template) return;
+
+  listEl.innerHTML = '';
+
+  const items = getVisibleItems();
+
+  if (!items.length) {
+    const empty = el('div', { class: 'cms-row-empty', text: 'Fant ingen items' });
+    listEl.appendChild(empty);
+    state.selectedItemIds.clear();
+    if (selectAll) selectAll.checked = false;
+    return;
+  }
+
+  const validIds = new Set(state.items.map(i => i.id));
+  for (const id of [...state.selectedItemIds]) {
+    if (!validIds.has(id)) state.selectedItemIds.delete(id);
+  }
+
+  const extra = getPinnedExtraFields();
+  const table = qs('#items-table');
+if (table) {
+  const extraCount = getPinnedExtraFields().length;
+  table.style.setProperty('--cms-extra-cols', String(extraCount));
+  table.classList.toggle('has-extra-cols', extraCount > 0);
+}
+
+
+  items.forEach(item => {
+    const fd = item.fieldData || {};
+    const statusInfo = deriveItemStatus(item);
+    const name = fd.name || '(uten navn)';
+    const isSelected = state.selectedItemIds.has(item.id);
+
+    const row = template.cloneNode(true);
+row.removeAttribute('id');
+row.style.display = '';
+row.classList.add('cms-row'); 
+
+
+const checkbox = row.querySelector('#list-item-checkbox-template') ||
+                 row.querySelector('input[type="checkbox"]');
+
+if (checkbox) {
+  if (checkbox.id === 'list-item-checkbox-template') {
+    checkbox.removeAttribute('id');
+  }
+
+  checkbox.classList.add('item-select');
+  checkbox.dataset.itemId = item.id;
+  checkbox.checked = isSelected;
+
+  checkbox.addEventListener('change', () => {
+    if (checkbox.checked) {
+      state.selectedItemIds.add(item.id);
+    } else {
+      state.selectedItemIds.delete(item.id);
+    }
+    syncSelectAllCheckbox();
+  });
+}
+
+
+    const cellsWrap = row.querySelector('#edit-this-item') || row.querySelector('.cms-row-cells');
+    if (cellsWrap && cellsWrap.id === 'edit-this-item') {
+      cellsWrap.removeAttribute('id');
+    }
+    if (cellsWrap) cellsWrap.innerHTML = '';
+
+
+    const nameCell = el('div', { class: 'cms-cell cms-cell--name' }, [
+      document.createTextNode(name)
+    ]);
+    cellsWrap.appendChild(nameCell);
+
+    const statusCell = el('div', { class: 'cms-cell cms-cell--status' });
+    const dot = el('span', { class: 'status-dot' + (statusInfo.published ? '' : ' unpublished') });
+    const txt = el('span', { class: 'status-text', text: statusInfo.label });
+    statusCell.appendChild(dot);
+    statusCell.appendChild(txt);
+    cellsWrap.appendChild(statusCell);
+
+
+      extra.forEach(slug => {
+    const cell = el('div', {
+      class: 'cms-cell cms-cell--extra cms-cell--' + slug
+    });
+
+    if (slug === '__metaCreated') {
+      const createdRaw =
+        item.createdOn ||
+        item.created ||
+        item.createdAt ||
+        null;
+
+      let text = '';
+      if (createdRaw) {
+        const d = new Date(createdRaw);
+        text = !Number.isNaN(d.getTime())
+          ? d.toLocaleDateString('nb-NO')
+          : createdRaw;
+      }
+      cell.textContent = text;
+      cellsWrap.appendChild(cell);
+      return;
+    }
+
+    if (slug === '__metaPublished') {
+      const pubRaw =
+        item.lastPublished ||
+        item.lastPublishedOn ||
+        item.publishedOn ||
+        null;
+
+      let text = '';
+      if (pubRaw) {
+        const d = new Date(pubRaw);
+        text = !Number.isNaN(d.getTime())
+          ? d.toLocaleDateString('nb-NO')
+          : pubRaw;
+      }
+      cell.textContent = text;
+      cellsWrap.appendChild(cell);
+      return;
+    }
+
+    const field = state.fieldsBySlug[slug];
+    const raw   = fd[slug];
+
+    if (field && (field.type === 'Image' || field.type === 'ImageRef')) {
+      cell.classList.add('cms-cell--image');
+
+      const url =
+        raw &&
+        (raw.url ||
+         (raw.file && raw.file.url) ||
+         raw.assetUrl);
+
+      if (url) {
+        const img = el('img', {
+          class: 'cms-thumb',
+          src: url,
+          alt: ''
+        });
+        cell.appendChild(img);
+      } else {
+        const ph = el('div', { class: 'cms-thumb-placeholder' });
+        cell.appendChild(ph);
+      }
+
+    } else if (field && field.type === 'MultiImage') {
+      cell.classList.add('cms-cell--multiimage');
+
+      let first = null;
+      if (Array.isArray(raw) && raw.length) {
+        first = raw[0];
+      }
+      const url =
+        first &&
+        (first.url ||
+         (first.file && first.file.url) ||
+         first.assetUrl);
+
+      if (url) {
+        const img = el('img', {
+          class: 'cms-thumb',
+          src: url,
+          alt: ''
+        });
+        cell.appendChild(img);
+      } else {
+        const ph = el('div', { class: 'cms-thumb-placeholder' });
+        cell.appendChild(ph);
+      }
+
+    } else if (field && (field.type === 'Bool' || field.type === 'Switch')) {
+      cell.textContent = raw ? 'På' : 'Av';
+
+    } else if (field && (field.type === 'Reference' || field.type === 'MultiReference')) {
+      let text = '';
+
+      if (field.type === 'Reference') {
+        text = resolveReferenceLabel(field, raw);
+      } else if (Array.isArray(raw)) {
+        text = raw
+          .map(v => resolveReferenceLabel(field, v))
+          .filter(Boolean)
+          .join(', ');
+      }
+
+      cell.textContent = text || '';
+    } else {
+      let text = '';
+      if (raw != null) text = String(raw);
+      cell.textContent = text;
+    }
+
+    cellsWrap.appendChild(cell);
+
+});
+
+
+
+    const clickTarget = cellsWrap || row;
+    clickTarget.addEventListener('click', (e) => {
+      if (checkbox && (e.target === checkbox || checkbox.contains(e.target))) return;
+      loadItemIntoEditor(item.id);
+    });
+
+    if (state.currentItem && state.currentItem.id === item.id) {
+      row.classList.add('current');
+    }
+
+    listEl.appendChild(row);
+  });
+
+  syncSelectAllCheckbox();
+}
+
+
+
+function openEditor(){
+  const editor=qs('#item-editor');
+  if(editor)editor.classList.remove('closed');
+}
+
+function closeEditor(){
+  const editor=qs('#item-editor');
+  if(editor)editor.classList.add('closed');
+}
+
+function syncSelectAllCheckbox(){
+  const selectAll=qs('#select-all-items');
+  if(!selectAll)return;
+
+  const items=getVisibleItems();
+  if(!items.length){
+    selectAll.checked=false;
+    updateBulkActionButtons();
+    return;
+  }
+
+  const allIds=items.map(i=>i.id);
+  const allSelected=allIds.every(id=>state.selectedItemIds.has(id));
+  selectAll.checked=allSelected;
+
+  updateBulkActionButtons();
+}
+
+
+function updateBulkActionButtons() {
+  const host = qs('#selected-buttons');
+  if (!host) return;
+
+  const hasSelection = state.selectedItemIds && state.selectedItemIds.size > 0;
+
+  host.classList.toggle('close', !hasSelection);
+}
+
+
+
+function renderItemForm(item){
+  const fieldsContainer=qs('#item-fields');
+  if(!fieldsContainer)return;
+  fieldsContainer.innerHTML='';
+
+  const titleEl=qs('#item-editor-title');
+  const deleteBtn=qs('#delete-item-btn');
+
+  if(!item){
+    if(titleEl)titleEl.textContent='Ingen slide valgt';
+    renderEditorStatus(null);
+    return;
+  }
+
+  const name=item.fieldData?.name||'(no name)';
+
+  if(titleEl){
+    titleEl.textContent=state.isNew?'Ny slide':name;
+  }
+  if(deleteBtn){
+    deleteBtn.style.display=state.isNew?'none':'inline-block';
+  }
+
+  renderEditorStatus(item);
+
+  const fd=item.fieldData||{};
+  const fieldsMeta=state.collectionDetails?.fields||[];
+
+  const sortedFields=[...fieldsMeta].sort((a,b)=>{
+    const order=['name','slug'];
+    const ia=order.indexOf(a.slug);
+    const ib=order.indexOf(b.slug);
+    if(ia===-1 && ib===-1)return 0;
+    if(ia===-1)return 1;
+    if(ib===-1)return-1;
+    return ia-ib;
+  });
+
+  sortedFields.forEach(field=>{
+    const key=field.slug;
+    if(key==='slug')return;
+    if(SYSTEM_FIELDS.includes(key))return;
+
+    let value=fd[key];
+    if(value===undefined || value===null){
+      value=getDefaultValueForField(field);
+    }
+
+    if(field.type==='ImageRef'||field.type==='Image'||field.type==='MultiImage'){
+      const ctrl=(field.type==='MultiImage')
+        ?createMultiImageFieldControl(field,value)
+        :createImageFieldControl(field,value);
+      fieldsContainer.appendChild(ctrl);
+      return;
+    }
+
+    const input=createFieldInput(field,key,value);
+    const wrapper=el('div',{
+      class:`cms-field cms-field--type-${field.type} cms-field--slug-${key}`
+    });
+
+    const label=el('label',{class:'cms-field-label'},[
+      document.createTextNode(field.displayName||field.name||key)
+    ]);
+
+    wrapper.appendChild(label);
+    wrapper.appendChild(input);
+    addHelp(field,wrapper);
+    fieldsContainer.appendChild(wrapper);
+  });
+}
+
+function renderEditorStatus(item){
+  const host=qs('#item-editor-status');
+  if(!host)return;
+
+  host.innerHTML='';
+  if(!item)return;
+
+  const template=document.querySelector('#list-item-status-template');
+  const statusInfo=deriveItemStatus(item);
+  const statusText=statusInfo.label;
+
+  if(!template){
+    const fallback=el('div',{},[document.createTextNode(statusText)]);
+    host.appendChild(fallback);
+    return;
+  }
+
+  const pill=template.cloneNode(true);
+  pill.removeAttribute('id');
+
+  const dotEl=pill.querySelector('#list-item-status-dot-template');
+  const txtEl=pill.querySelector('#list-item-status-txt-template');
+
+  if(dotEl){
+    dotEl.removeAttribute('id');
+    if(statusInfo.published)dotEl.classList.remove('unpublished');
+    else dotEl.classList.add('unpublished');
+  }
+
+  if(txtEl){
+    txtEl.removeAttribute('id');
+    txtEl.textContent=statusText;
+  }
+
+  host.appendChild(pill);
+}
+
+function applyCommonValidations(field,input){
+  if(!field||!input)return;
+  const v=field.validations||{};
+
+  if(field.isRequired){
+    input.required=true;
+    input.setAttribute('aria-required','true');
+  }
+
+  if(typeof v.maxLength==='number' && 'maxLength' in input){
+    input.maxLength=v.maxLength;
+  }
+
+  if(v.pattern && typeof v.pattern.regex==='string'){
+    input.pattern=v.pattern.regex;
+  }else if(field.slug==='slug'){
+    input.pattern='[a-zA-Z0-9_\\-]+';
+  }
+
+  if(field.helpText){
+    input.title=field.helpText;
+  }
+}
+
+function getFieldDataFromForm(){
+  const container=qs('#item-fields');
+  if(!container)return{};
+  const inputs=container.querySelectorAll('[data-field-key]');
+  const fieldData={};
+
+  container.querySelectorAll('.cms-field-error').forEach(n=>n.remove());
+  container.querySelectorAll('.cms-field--invalid').forEach(n=>n.classList.remove('cms-field--invalid'));
+
+  inputs.forEach(input=>{
+    const key=input.getAttribute('data-field-key');
+    const fieldDef=state.fieldsBySlug && state.fieldsBySlug[key];
+
+    if(input.dataset.multiImageJson==='true'){
+      try{
+        const arr=JSON.parse(input.value||'[]');
+        fieldData[key]=Array.isArray(arr)?arr:[];
+      }catch{
+        fieldData[key]=[];
+      }
+      return;
+    }
+
+    if(input.dataset.imageJson==='true'){
+      try{
+        const meta=JSON.parse(input.value||'{}')||{};
+        if(meta &&(meta.url||meta.fileId||meta.pendingUpload))fieldData[key]=meta;
+        else fieldData[key]=null;
+      }catch{
+        fieldData[key]=null;
+      }
+      return;
+    }
+
+    if(input.type==='hidden')return;
+
+    if(input.type==='checkbox'){
+      fieldData[key]=input.checked;
+      return;
+    }
+
+    if(input.tagName==='TEXTAREA'){
+      fieldData[key]=input.value;
+      return;
+    }
+
+    if(input.tagName==='SELECT'){
+      if(input.multiple){
+        const selected=Array.from(input.selectedOptions||[])
+          .map(o=>o.value)
+          .filter(Boolean);
+        fieldData[key]=selected;
+      }else{
+        fieldData[key]=input.value||'';
+      }
+      return;
+    }
+
+    if(input.type==='number'){
+      const n=Number(input.value);
+      fieldData[key]=Number.isNaN(n)?null:n;
+      return;
+    }
+
+    const val=input.value;
+
+    if(fieldDef && fieldDef.type==='Color'){
+      const hex=normalizeColorToHex(val);
+      fieldData[key]=hex||val;
+      return;
+    }
+
+    if(key==='_draft'||key==='_archived'){
+      fieldData[key]=val==='true';
+    }else{
+      fieldData[key]=val;
+    }
+  });
+
+  return fieldData;
+}
+
+function validateForm(){
+  const container=qs('#item-fields');
+  if(!container)return true;
+
+  container.querySelectorAll('.cms-field-error').forEach(n=>n.remove());
+  container.querySelectorAll('.cms-field--invalid').forEach(n=>n.classList.remove('cms-field--invalid'));
+
+  const inputs=container.querySelectorAll('[data-field-key]');
+  let ok=true;
+
+  inputs.forEach(input=>{
+    const key=input.getAttribute('data-field-key');
+    const fieldDef=state.fieldsBySlug && state.fieldsBySlug[key];
+    const wrapper=input.closest('.cms-field')||input.parentElement;
+    if(!wrapper)return;
+    if(input.type==='hidden')return;
+
+    let isValid=true;
+    const messages=[];
+    const rawVal=(input.type==='checkbox')?(input.checked?'on':''):(input.value||'');
+    const val=rawVal.trim();
+
+    if((fieldDef && fieldDef.isRequired)||input.required){
+      if(input.type==='checkbox'){
+        if(!input.checked){
+          isValid=false;
+          messages.push('Dette feltet er påkrevd.');
+        }
+      }else if(!val){
+        isValid=false;
+        messages.push('Dette feltet er påkrevd.');
+      }
+    }
+
+    if(isValid && val){
+      if(input.type==='email'){
+        const re=/^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if(!re.test(val)){
+          isValid=false;
+          messages.push('Ugyldig e-postadresse.');
+        }
+      }
+
+      if(input.type==='url'){
+        try{
+          new URL(val);
+        }catch{
+          isValid=false;
+          messages.push('Ugyldig URL.');
+        }
+      }
+
+      if(input.type==='number'){
+        if(Number.isNaN(Number(val))){
+          isValid=false;
+          messages.push('Må være et tall.');
+        }
+      }
+
+      const pattern=input.getAttribute('pattern');
+      if(pattern){
+        try{
+          const re=new RegExp(pattern);
+          if(!re.test(val)){
+            isValid=false;
+            messages.push('Ugyldig format.');
+          }
+        }catch{}
+      }
+
+      const maxL=input.maxLength>0
+        ?input.maxLength
+        :(fieldDef && fieldDef.validations && fieldDef.validations.maxLength);
+      if(maxL && val.length>maxL){
+        isValid=false;
+        messages.push(`Maks ${maxL} tegn.`);
+      }
+
+      const minL=fieldDef && fieldDef.validations && fieldDef.validations.minLength;
+      if(minL && val.length<minL){
+        isValid=false;
+        messages.push(`Minst ${minL} tegn.`);
+      }
+
+      if(fieldDef && fieldDef.type==='Color'){
+        if(!normalizeColorToHex(val)){
+          isValid=false;
+          messages.push('Ugyldig farge. Bruk hex, navn, rgb osv.');
+        }
+      }
+    }
+
+    if(!isValid){
+      ok=false;
+      wrapper.classList.add('cms-field--invalid');
+      const msgEl=el('div',{class:'cms-field-error'},[
+        document.createTextNode(messages.join(' '))
+      ]);
+      wrapper.appendChild(msgEl);
+    }
+  });
+
+  if(!ok){
+    setStatus('Noen felter har ugyldige verdier. Rett dem og prøv igjen.',true);
+  }
+
+  return ok;
+}
+
+async function loadItemIntoEditor(itemId){
+  try{
+    setStatus('Laster inn element…');
+    const item=await apiGetItem(state.collectionId,itemId);
+    state.currentItem=item;
+    state.isNew=false;
+
+    renderItemForm(item);
+    renderItemsList();
+    openEditor();
+    updateEditorButtons();
+    setStatus('Element lastet');
+  }catch(err){
+    console.error(err);
+    setStatus('Kunne ikke laste element',true);
+  }
+}
+
+async function handleSave(e){
+  if(e && e.preventDefault)e.preventDefault();
+  if(!state.collectionId)return;
+  if(!validateForm())return;
+
+  try{
+    setStatus('Lagrer…');
+    let fieldData=getFieldDataFromForm();
+    fieldData=await prepareImagesBeforeSave(fieldData);
+
+    let wasPublished=false;
+    if(!state.isNew && state.currentItem){
+      try{
+        wasPublished=deriveItemStatus(state.currentItem).published;
+      }catch{}
+    }
+
+    if(state.isNew){
+      if(!fieldData.slug||!fieldData.slug.trim()){
+        const base=(fieldData.name||'')
+          .toString()
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g,'-')
+          .replace(/[^a-z0-9_-]/g,'')
+          .slice(0,256);
+        fieldData.slug=base;
+      }
+    }
+
+    let savedItem;
+    if(state.isNew || !state.currentItem?.id){
+      savedItem=await apiCreateItem(state.collectionId,fieldData);
+      state.isNew=false;
+    }else{
+      savedItem=await apiUpdateItem(state.collectionId,state.currentItem.id,fieldData);
+    }
+
+    state.currentItem = savedItem;
+
+    if (wasPublished && savedItem?.id) {
+      try {
+        await apiPublishItem(state.collectionId, savedItem.id);
+      } catch (err) {
+        console.error('Auto-publish etter lagring feilet:', err);
+        setStatus('Element lagret, men aktivering feilet', true);
+      }
+    }
+
+    const data = await apiGetItems(state.collectionId);
+    state.items = data.items || [];
+    renderItemsList();
+    renderItemForm(savedItem);
+    updateEditorButtons();
+
+    // Enkelt og likt uansett tidligere status:
+    setStatus('Element lagret');
+    if (wasPublished && typeof refreshIframes === 'function') {
+      refreshIframes();
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus('Lagring feilet', true);
+  }
+
+}
+
+
+
+function handleCloseItem(e){
+  if(e && e.preventDefault)e.preventDefault();
+  state.currentItem=null;
+  state.isNew=false;
+  renderItemForm(null);
+  renderItemsList();
+  closeEditor();
+  updateEditorButtons();
+}
+
+async function handleDelete() {
+  if (!state.currentItem?.id || state.isNew) return;
+
+  const name = state.currentItem.fieldData?.name || '(uten navn)';
+  
+  const ok = await askConfirm(
+    `Er du sikker på at du vil slette "${name}"?\n\nDette kan ikke angres.`
+  );
+  if (!ok) return;
+
+  try {
+    const id = state.currentItem.id;
+
+    setStatus('Deaktiverer element før sletting…');
+    try {
+      await apiUnpublishItem(state.collectionId, id);
+    } catch {}
+
+    setStatus('Sletter…');
+    await apiDeleteItem(state.collectionId, id);
+    setStatus('Element slettet');
+
+    state.items = state.items.filter(it => it.id !== id);
+    state.selectedItemIds.delete(id);
+    state.currentItem = null;
+    state.isNew = false;
+
+    renderItemsList();
+    renderItemForm(null);
+    closeEditor();
+    updateEditorButtons();
+    refreshIframes();
+
+  } catch (err) {
+    console.error(err);
+    setStatus('Sletting feilet', true);
+  }
+}
+
+
+
+function handleNewItem(){
+  state.isNew=true;
+  state.currentItem={fieldData:{}};
+  renderItemForm(state.currentItem);
+  renderItemsList();
+  openEditor();
+  updateEditorButtons();
+}
+
+async function handlePublishItem(){
+  if (!state.currentItem?.id || !state.collectionId) return;
+  if (!validateForm()) return;
+
+  const name = state.currentItem.fieldData?.name || '(uten navn)';
+
+  const ok = await askConfirm(
+    `Er du sikker på at du vil aktivere "${name}"?`
+  );
+  if (!ok) return;
+
+  try {
+    setStatus('Lagrer og aktiverer…');
+
+    let fieldData = getFieldDataFromForm();
+    fieldData = await prepareImagesBeforeSave(fieldData);
+
+    const savedItem = await apiUpdateItem(
+      state.collectionId,
+      state.currentItem.id,
+      fieldData
+    );
+    state.currentItem = savedItem;
+
+    await apiPublishItem(state.collectionId, state.currentItem.id);
+
+    const [items, item] = await Promise.all([
+      apiGetItems(state.collectionId),
+      apiGetItem(state.collectionId, state.currentItem.id)
+    ]);
+
+    state.items = items.items || [];
+    state.currentItem = item;
+    renderItemsList();
+    renderItemForm(item);
+    updateEditorButtons();
+    setStatus('Element aktivert');
+    refreshIframes();
+  } catch (err) {
+    console.error(err);
+    setStatus('Aktivering feilet', true);
+  }
+}
+
+
+
+async function handleUnpublishItem(){
+  if (!state.currentItem?.id || !state.collectionId) return;
+
+  const name = state.currentItem.fieldData?.name || '(uten navn)';
+
+  const ok = await askConfirm(
+    `Er du sikker på at du vil deaktivere "${name}"?`
+  );
+  if (!ok) return;
+
+  try {
+    setStatus('Deaktiverer…');
+    await apiUnpublishItem(state.collectionId, state.currentItem.id);
+    setStatus('Element deaktivert');
+
+    const [items, item] = await Promise.all([
+      apiGetItems(state.collectionId),
+      apiGetItem(state.collectionId, state.currentItem.id)
+    ]);
+
+    state.items = items.items || [];
+    state.currentItem = item;
+    renderItemsList();
+    renderItemForm(item);
+    updateEditorButtons();
+    refreshIframes();
+  } catch (err) {
+    console.error(err);
+    setStatus('Deaktivering feilet', true);
+  }
+}
+
+
+function handleSelectAllChange(){
+  const selectAll=qs('#select-all-items');
+  if(!selectAll)return;
+
+  state.selectedItemIds.clear();
+
+  const items=getVisibleItems();
+  if(selectAll.checked){
+    items.forEach(item=>state.selectedItemIds.add(item.id));
+  }
+
+  renderItemsList();
+  updateBulkActionButtons();
+}
+</script>
+
+<script>
+    
+async function optImgs(fd){
+  try{
+    const r=await fetch(APP_URL+'/api/images/optimize',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fieldData:fd,maxSizeKB:IMG_MAX_KB})
+    });
+    if(!r.ok)return fd;
+    const o=await r.json().catch(()=>null);
+    return(o&&o.fieldData)||fd;
+  }catch(e){
+    console.error('optImgs failed',e);
+    return fd;
+  }
+}
+
+
+async function apiGetCollectionDetails(collectionId){
+  const res=await fetch(`${APP_URL}/api/collection/${collectionId}`);
+  const text=await res.text();
+  if(!res.ok)throw new Error(`Collection details error: ${res.status}`);
+  return JSON.parse(text);
+}
+
+async function apiGetItems(collectionId,limit=100,offset=0){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}?limit=${limit}&offset=${offset}`);
+  if(!res.ok)throw new Error(`Get items error: ${res.status}`);
+  return res.json();
+}
+
+async function apiGetItem(collectionId,itemId){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/${itemId}`);
+  if(!res.ok)throw new Error(`Get item error: ${res.status}`);
+  return res.json();
+}
+
+async function apiUpdateItem(collectionId,itemId,fieldData){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/${itemId}`,{
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fieldData})
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Update response body:',t);
+    throw new Error(`Update item error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiCreateItem(collectionId,fieldData){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/create`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fieldData})
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Create response body:',t);
+    throw new Error(`Create item error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiDeleteItem(collectionId,itemId){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/${itemId}`,{
+    method:'DELETE'
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Delete response body:',t);
+    throw new Error(`Delete item error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function sha256HexOfFile(file){
+  const buf=await file.arrayBuffer();
+  const hashBuf=await crypto.subtle.digest('SHA-256',buf);
+  const hashBytes=new Uint8Array(hashBuf);
+  let hex='';
+  for(let i=0;i<hashBytes.length;i++){
+    hex+=hashBytes[i].toString(16).padStart(2,'0');
+  }
+  return hex;
+}
+
+async function apiUploadAsset(file){
+  // We now skip fileHash to avoid any mismatch with the server.
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('displayName', file.name);
+
+  const res = await fetch(`${APP_URL}/api/assets/upload`, {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!res.ok) {
+    let errorText = '';
+    try { errorText = await res.text(); } catch {}
+    console.error('Upload response body:', errorText);
+    throw new Error(`Upload asset error: ${res.status}`);
+  }
+
+  const initial = await res.json();
+  console.log('upload initial', initial);
+
+  function normalizeRaw(raw) {
+    const a = raw.asset || raw;
+    return {
+      id: a.id,
+      url: a.url || a.assetUrl || (a.file && a.file.url) || "",
+      displayName: a.displayName || a.originalFileName || file.name,
+      alt: a.alt || a.displayName || a.originalFileName || file.name,
+      createdOn: a.createdOn,
+      lastUpdated: a.lastUpdated
+    };
+  }
+
+  // If backend says "pending", do client-side polling for URL
+  if (initial.pending) {
+    console.log('Asset pending, polling for URL…', initial.id);
+
+    // We can safely poll longer on the client (server timeout is no longer an issue here)
+    for (let i = 0; i < 30; i++) { // ~30s total
+      await new Promise(r => setTimeout(r, 1000));
+
+      const pollRes = await fetch(`${APP_URL}/api/assets/${initial.id}`);
+      if (!pollRes.ok) {
+        console.warn('Poll failed one round', pollRes.status);
+        continue;
+      }
+
+      const polled = await pollRes.json();
+      console.log('polled asset', polled);
+
+      const a = polled.asset || polled;
+      const url = a && (a.url || a.assetUrl || (a.file && a.file.url));
+      if (url) {
+        return normalizeRaw(a);
+      }
+    }
+
+    throw new Error('Timeout waiting for asset URL');
+  }
+
+  // Non-pending: URL should already be present
+  return normalizeRaw(initial);
+}
+
+
+
+function setupPinnedFieldsControl() {
+  const control   = qs('#pinned-fields-control');
+  const toggle    = qs('#pinned-fields-toggle');
+  const dropdown  = qs('#pinned-fields-dropdown');
+  const inner     = qs('#pinned-fields-dropdown-inner');
+
+  if (!control || !toggle || !dropdown || !inner || !state.collectionDetails) return;
+
+  // Build options dynamically from collection fields
+  inner.innerHTML = '';
+
+  const fieldsMeta = state.collectionDetails.fields || [];
+  fieldsMeta.forEach(field => {
+    const slug = field.slug;
+    if (!slug) return;
+
+    // skip system-ish fields
+    if (slug === 'name' || slug === 'slug' || slug === '_archived' || slug === '_draft') return;
+
+    const btn = el('button', {
+      type: 'button',
+      class: 'pinned-field-option',
+      'data-field-slug': slug
+    }, [
+      el('span', { class: 'pinned-field-check', text: '✓' }),
+      el('span', { class: 'pinned-field-label', text: field.displayName || field.name || slug })
+    ]);
+
+    inner.appendChild(btn);
+  });
+
+    // --- Extra meta fields: created + published ---
+  const META_PINNABLE = [
+    { slug: '__metaCreated',   label: 'Opprettet' },
+    { slug: '__metaPublished', label: 'Sist publisert' },
+  ];
+
+  META_PINNABLE.forEach(meta => {
+    const btn = el('button', {
+      type: 'button',
+      class: 'pinned-field-option',
+      'data-field-slug': meta.slug
+    }, [
+      el('span', { class: 'pinned-field-check', text: '✓' }),
+      el('span', { class: 'pinned-field-label', text: meta.label })
+    ]);
+    inner.appendChild(btn);
+  });
+
+
+  function syncPinnedUI() {
+    const selected = new Set(state.pinnedFields);
+    inner.querySelectorAll('.pinned-field-option').forEach(btn => {
+      const slug = btn.getAttribute('data-field-slug');
+      if (selected.has(slug)) btn.classList.add('is-selected');
+      else btn.classList.remove('is-selected');
+    });
+
+    const table = qs('#items-table');
+if (table) {
+  const extraCount = getPinnedExtraFields().length;
+  table.style.setProperty('--cms-extra-cols', String(extraCount));
+  table.classList.toggle('has-extra-cols', extraCount > 0);
+}
+
+    // Rerender header + list
+    renderItemsHeader();
+    renderItemsList();
+    saveEditorPrefs();
+  }
+
+  inner.addEventListener('click', (e) => {
+    const btn = e.target.closest('.pinned-field-option');
+    if (!btn) return;
+    const slug = btn.getAttribute('data-field-slug');
+    if (!slug) return;
+
+    // toggle selection – keep "name" and "status" always present
+    const idx = state.pinnedFields.indexOf(slug);
+    if (idx === -1) {
+      state.pinnedFields.push(slug);
+    } else if (slug !== 'name' && slug !== 'status') {
+      state.pinnedFields.splice(idx, 1);
+    }
+    syncPinnedUI();
+  });
+
+  toggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isOpen = control.classList.toggle('is-open');
+    toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  });
+
+  // Close when clicking outside
+  document.addEventListener('click', (e) => {
+    if (!control.contains(e.target)) {
+      control.classList.remove('is-open');
+      toggle.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  syncPinnedUI();
+}
+
+
+async function apiPublishItem(collectionId,itemId){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/${itemId}/publish`,{
+    method:'POST'
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Publish response body:',t);
+    throw new Error(`Publish item error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiUnpublishItem(collectionId,itemId){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/${itemId}/unpublish`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items:[itemId]})
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Unpublish response body:',t);
+    throw new Error(`Unpublish item error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiPublishMany(collectionId,itemIds){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/publish-many`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({itemIds})
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Publish-many response body:',t);
+    throw new Error(`Publish-many error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiUnpublishMany(collectionId,itemIds){
+  const res=await fetch(`${APP_URL}/api/cms/${collectionId}/unpublish-many`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items:itemIds})
+  });
+  if(!res.ok){
+    const t=await res.text().catch(()=> '');
+    console.error('Unpublish-many response body:',t);
+    throw new Error(`Unpublish-many error: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function compressImageToWebp(file, maxBytes = IMG_MAX_BYTES){
+  const dataUrl = await new Promise((res, rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result);
+    r.onerror=rej;
+    r.readAsDataURL(file);
+  });
+
+  const img = await new Promise((res, rej)=>{
+    const i=new Image();
+    i.onload=()=>res(i);
+    i.onerror=rej;
+    i.src=dataUrl;
+  });
+
+  const c=document.createElement('canvas');
+  const ctx=c.getContext('2d');
+
+  const ow=img.naturalWidth||img.width;
+  const oh=img.naturalHeight||img.height;
+
+  let w=ow;
+  let q=0.8;
+  const MIN_W=320;
+  const MIN_Q=0.25;
+  let best=null;
+
+  while(true){
+    const scale=w/ow;
+    const h=Math.round(oh*scale);
+    c.width=w;
+    c.height=h;
+    ctx.clearRect(0,0,w,h);
+    ctx.drawImage(img,0,0,w,h);
+
+    const blob=await new Promise(r=>c.toBlob(r,'image/webp',q));
+
+    if(blob){
+      if(!best || blob.size < best.size) best = blob;
+      if(blob.size <= maxBytes){
+        return new File([blob],
+          file.name.replace(/\.[^.]+$/, '')+'.webp',
+          {type:'image/webp'}
+        );
+      }
+    }
+
+    if(w <= MIN_W && q <= MIN_Q){
+      const b=best||blob;
+      if(!b) return file;
+      return new File([b],
+        file.name.replace(/\.[^.]+$/, '')+'.webp',
+        {type:'image/webp'}
+      );
+    }
+
+    if(q > MIN_Q) q = Math.max(MIN_Q, q-0.1);
+    else w = Math.max(MIN_W, Math.round(w*0.7));
+  }
+}
+
+
+function sleep(ms){
+  return new Promise(res => setTimeout(res, ms));
+}
+
+async function apiGetAsset(assetId){
+  const res = await fetch(`${APP_URL}/api/assets/${assetId}`);
+  if (!res.ok) throw new Error(`Get asset error: ${res.status}`);
+  return res.json(); // expect { asset: { ... } }
+}
+
+
+async function prepareImagesBeforeSave(fieldData){
+  for (const [key, val] of Object.entries(fieldData)) {
+    if (!val || typeof val !== 'object') continue;
+    if (!val.pendingUpload) continue;
+
+    const pending = state.pendingImages.get(key);
+    if (!pending || !pending.file) continue;
+
+    try {
+      setStatus(`Laster opp bilde for "${key}"…`);
+
+      // Upload the already-compressed file from state.pendingImages
+      const asset = await apiUploadAsset(pending.file);
+
+      fieldData[key] = {
+        fileId: asset.id,
+        url: asset.url,  // this is what the CMS validation cares about
+        alt: val.alt || "",
+        displayName: asset.displayName || pending.file.name
+      };
+
+      console.log('Prepared CMS image for field', key, fieldData[key]);
+
+      state.pendingImages.delete(key);
+      if (pending.previewUrl) {
+        try { URL.revokeObjectURL(pending.previewUrl); } catch {}
+      }
+    } catch (err) {
+      console.error('Failed to upload image for field', key, err);
+      setStatus(`Kunne ikke laste opp bilde for "${key}"`, true);
+      // Abort save/publish, so you don't end up creating an item with a broken image
+      throw err;
+    }
+  }
+
+  return fieldData;
+}
+
+
+function askConfirm(message) {
+  return new Promise((resolve) => {
+    const box   = document.getElementById('confirm-message');
+    const txt   = document.getElementById('confirm-txt');
+    const btnYes = document.getElementById('confirm-yes');
+    const btnNo  = document.getElementById('confirm-no');
+
+    if (!box || !txt || !btnYes || !btnNo) {
+      console.warn('Custom confirm elements missing, falling back to browser confirm()');
+      resolve(window.confirm(message));
+      return;
+    }
+
+    // Set message text
+    txt.textContent = message;
+
+    // Show modal
+    box.classList.remove('hidden');
+
+    function cleanup() {
+      btnYes.removeEventListener('click', onYes);
+      btnNo.removeEventListener('click', onNo);
+      box.classList.add('hidden');
+    }
+
+    function onYes() {
+      cleanup();
+      resolve(true);
+    }
+
+    function onNo() {
+      cleanup();
+      resolve(false);
+    }
+
+    btnYes.addEventListener('click', onYes);
+    btnNo.addEventListener('click', onNo);
+  });
+}
+
+
+
+async function handlePublishSelected(){
+  if (!state.collectionId) return;
+
+  const ids = [...state.selectedItemIds];
+  if (!ids.length) {
+    alert('Ingen elementer valgt');
+    return;
+  }
+
+  const ok = await askConfirm(
+    `Er du sikker på at du vil optimalisere bilder og aktivere ${ids.length} element(er)?`
+  );
+  if (!ok) return;
+
+  try{
+    setStatus(`Optimaliserer bilder for ${ids.length} element(er)…`);
+
+    const toPublish=[];
+
+    for(const id of ids){
+      try{
+        const item=await apiGetItem(state.collectionId,id);
+        if(!item || !item.fieldData){
+          toPublish.push(id);
+          continue;
+        }
+
+        let optimizedFieldData=await optImgs(item.fieldData);
+        await apiUpdateItem(state.collectionId,id,optimizedFieldData);
+
+        toPublish.push(id);
+      }catch(err){
+        console.error('Failed to optimize item',id,err);
+        toPublish.push(id);
+      }
+    }
+
+    setStatus(`Aktiverer ${toPublish.length} element(er)…`);
+
+    await apiPublishMany(state.collectionId,toPublish);
+
+    setStatus(`Aktivert ${toPublish.length} element(er)`);
+    refreshIframes();
+
+    const data=await apiGetItems(state.collectionId);
+    state.items=data.items||[];
+    renderItemsList();
+
+    if(state.currentItem?.id){
+      const item=await apiGetItem(state.collectionId,state.currentItem.id);
+      state.currentItem=item;
+      renderItemForm(item);
+      updateEditorButtons();
+    }
+  }catch(err){
+    console.error(err);
+    setStatus('Kunne ikke aktivere valgte elementer',true);
+  }
+}
+
+
+async function handleUnpublishSelected(){
+  if (!state.collectionId) return;
+
+  const ids = [...state.selectedItemIds];
+  if (!ids.length){
+    alert('Ingen elementer valgt');
+    return;
+  }
+
+  const ok = await askConfirm(
+    `Er du sikker på at du vil deaktivere ${ids.length} element(er)?`
+  );
+  if (!ok) return;
+
+  try{
+    setStatus(`Deaktiverer ${ids.length} element(er)…`);
+    await apiUnpublishMany(state.collectionId,ids);
+    setStatus(`Deaktivert ${ids.length} element(er)`);
+    refreshIframes();
+
+    const data=await apiGetItems(state.collectionId);
+    state.items=data.items||[];
+    renderItemsList();
+
+    if(state.currentItem?.id){
+      const item=await apiGetItem(state.collectionId,state.currentItem.id);
+      state.currentItem=item;
+      renderItemForm(item);
+      updateEditorButtons();
+    }
+  }catch(err){
+    console.error(err);
+    setStatus('Kunne ikke deaktivere',true);
+  }
+}
+
+
+async function handleDeleteSelected() {
+  if (!state.collectionId) return;
+
+  const ids = [...state.selectedItemIds];
+  if (!ids.length) {
+    alert('Ingen elementer valgt');
+    return;
+  }
+
+    const msg =
+    `Er du sikker på at du vil slette ${ids.length} element(er)?\n` +
+    'Dette kan ikke angres.';
+  const ok = await askConfirm(msg);
+  if (!ok) return;
+
+
+  try {
+    // 1) Try to unpublish all first (to hide them on live)
+    try {
+      setStatus(`Deaktiverer ${ids.length} element(er) før sletting…`);
+      await apiUnpublishMany(state.collectionId, ids);
+    } catch (e) {
+      console.warn('Kunne ikke deaktivere alle før sletting, fortsetter:', e);
+    }
+
+    // 2) Delete one by one using existing endpoint
+    setStatus(`Sletter ${ids.length} element(er)…`);
+    for (const id of ids) {
+      try {
+        await apiDeleteItem(state.collectionId, id);
+      } catch (e) {
+        console.error('Failed to delete item', id, e);
+      }
+    }
+
+    // 3) Refresh local state + UI
+    const data = await apiGetItems(state.collectionId);
+    state.items = data.items || [];
+    state.selectedItemIds.clear();
+    state.currentItem = null;
+    state.isNew = false;
+
+    renderItemsList();
+    renderItemForm(null);
+    updateEditorButtons();
+    refreshIframes();
+
+    setStatus(`Slettet ${ids.length} element(er)`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Kunne ikke slette valgte elementer', true);
+  }
+}
+
+// 🔁 Fetch ALL items for a reference collection (paging through limit/offset)
+// and cache them in window.refOptionsCache[collectionId]
+async function getAllRefItems(collectionId) {
+  if (!window.refOptionsCache) window.refOptionsCache = {};
+  const cache = window.refOptionsCache;
+
+  // If we've already loaded all pages once, just return cached list
+  if (cache[collectionId] && cache[collectionId].allLoaded) {
+    console.log('getAllRefItems: using cached items for', collectionId, cache[collectionId].items.length);
+    return cache[collectionId].items;
+  }
+
+  console.log('getAllRefItems: loading ALL pages for', collectionId);
+
+  const all = [];
+  let limit = 100;
+  let offset = 0;
+  let safetyCounter = 0;
+
+  while (true) {
+    // apiGetItems(collectionId, limit, offset)
+    const data = await apiGetItems(collectionId, limit, offset);
+    const items = data.items || [];
+    const total = (typeof data.total === 'number') ? data.total : null;
+
+    console.log('  page', { offset, got: items.length, total });
+
+    all.push(...items);
+
+    if (!items.length) break;          // no more results
+    offset += items.length;
+
+    if (total != null && all.length >= total) break; // reached known total
+
+    safetyCounter++;
+    if (safetyCounter > 50) {          // hard cap just in case (50 * 100 = 5000)
+      console.warn('getAllRefItems: safety break, too many pages');
+      break;
+    }
+  }
+
+  cache[collectionId] = {
+    items: all,
+    allLoaded: true
+  };
+
+  console.log('getAllRefItems: finished for', collectionId, 'items:', all.length);
+  return all;
+}
+
+async function warmAllRefCaches() {
+  if (!state.collectionDetails) return;
+
+  const fieldsMeta = state.collectionDetails.fields || [];
+
+  if (!window.refOptionsCache) window.refOptionsCache = {};
+  const refOptionsCache = window.refOptionsCache;
+  const seen = new Set();
+
+  console.log('🔥 Warming reference caches for this collection…');
+
+  for (const f of fieldsMeta) {
+    if (f.type !== 'Reference' && f.type !== 'MultiReference') continue;
+
+    const v = f.validations || {};
+    const refCollectionId = v.collectionId || v.collection || v.collectionSlug;
+    if (!refCollectionId) continue;
+    if (seen.has(refCollectionId)) continue;
+    if (refOptionsCache[refCollectionId]) continue; // already cached
+
+    seen.add(refCollectionId);
+
+    try {
+      console.log('  → loading ref collection', refCollectionId);
+      const items = await getAllRefItems(refCollectionId);
+
+      const labelById = {};
+      items.forEach(it => {
+        const fd = it.fieldData || {};
+        const label =
+          fd.name ||
+          fd.title ||
+          fd.slug ||
+          it.id;
+        labelById[it.id] = label;
+      });
+
+      refOptionsCache[refCollectionId] = {
+        items,
+        labelById
+      };
+
+      console.log('  ✓ cached', items.length, 'items for ref collection', refCollectionId);
+    } catch (err) {
+      console.error('Failed to warm ref cache for', refCollectionId, err);
+    }
+  }
+}
+
+
+async function loadReferenceOptions(collectionId, selectEl, currentValue, multiple, ui) {
+  if (!collectionId || !selectEl) return;
+
+  console.groupCollapsed('🔗 loadReferenceOptions', {
+    collectionId,
+    selectName: selectEl.name,
+    multiple
+  });
+
+  // --- Figure out which IDs are currently selected ---
+  let selectedIds = [];
+  if (multiple) {
+    if (Array.isArray(currentValue)) {
+      selectedIds = currentValue
+        .map(v => typeof v === "string" ? v : (v && (v.id || v._id)) || "")
+        .filter(Boolean);
+    }
+  } else {
+    const id = typeof currentValue === "string"
+      ? currentValue
+      : (currentValue && (currentValue.id || currentValue._id));
+    selectedIds = id ? [id] : [];
+  }
+  console.log('selectedIds', selectedIds);
+
+  // --- Load ALL ref items (all pages) + cache ---
+  if (!window.refOptionsCache) window.refOptionsCache = {};
+  const refOptionsCache = window.refOptionsCache;
+
+  let items;
+  if (refOptionsCache[collectionId]) {
+    // Re-use cached items
+    items = refOptionsCache[collectionId].items || [];
+  } else {
+    // Use our helper to ensure we get beyond the first 100
+    try {
+      items = await getAllRefItems(collectionId);
+    } catch (err) {
+      console.error('Failed to load reference options for', collectionId, err);
+      items = [];
+    }
+
+    // Build label map once per ref collection
+    const labelById = {};
+    items.forEach(it => {
+      const fd = it.fieldData || {};
+      const label =
+        fd.name ||
+        fd.title ||
+        fd.slug ||
+        it.id;
+      labelById[it.id] = label;
+    });
+
+    refOptionsCache[collectionId] = {
+      items,
+      labelById
+    };
+  }
+
+  console.log('total ref items from collection (all pages)', collectionId, items.length);
+
+
+
+  // --- Cache for reference *collection meta* (to get the options list) ---
+  window.refMetaCache = window.refMetaCache || {};
+  if (!window.refMetaCache[collectionId]) {
+    try {
+      const meta = await apiGetCollectionDetails(collectionId);
+      window.refMetaCache[collectionId] = meta;
+    } catch (err) {
+      console.error("Failed to load ref collection meta for", collectionId, err);
+      window.refMetaCache[collectionId] = null;
+    }
+  }
+
+  const refMeta = window.refMetaCache[collectionId];
+  let scopeField = null;
+  let optionMapById = null;
+
+  if (refMeta && Array.isArray(refMeta.fields)) {
+    scopeField = refMeta.fields.find(f => f.slug === REF_SCOPE_FIELD_SLUG);
+    if (!scopeField) {
+      console.warn('⚠️ No scope field found in ref collection for slug', REF_SCOPE_FIELD_SLUG);
+    } else {
+      console.log('✅ Found scope field', scopeField);
+    }
+
+    if (scopeField && scopeField.validations && Array.isArray(scopeField.validations.options)) {
+      optionMapById = {};
+      scopeField.validations.options.forEach(opt => {
+        optionMapById[opt.id] = opt.name || opt.id;
+      });
+      console.log('optionMapById from scope field', optionMapById);
+    }
+  } else {
+    console.warn('⚠️ No refMeta.fields for collection', collectionId, refMeta);
+  }
+
+  // --- Determine "current scope" (this editor's collection) ---
+  const titleHost =
+    document.getElementById('collection-title') ||
+    document.getElementById('collection-id');
+
+  const domTitle =
+    (titleHost && titleHost.textContent && titleHost.textContent.trim()) || '';
+
+  const currentScopeRaw =
+    domTitle ||
+    (state.collectionDetails &&
+      (state.collectionDetails.displayName || state.collectionDetails.slug)) ||
+    state.collectionId ||
+    "";
+
+  const currentScope = currentScopeRaw.trim().toLowerCase();
+
+  console.log('current scope resolution', {
+    domTitle,
+    collectionDisplayName: state.collectionDetails && state.collectionDetails.displayName,
+    collectionSlug: state.collectionDetails && state.collectionDetails.slug,
+    collectionId: state.collectionId,
+    currentScopeRaw,
+    currentScope
+  });
+
+  // --- Filter reference items by that scope ---
+  let filteredItems = items.slice();
+
+  if (scopeField) {
+    filteredItems = items.filter(refItem => {
+      const fd = refItem.fieldData || {};
+      const rawVal = (fd[REF_SCOPE_FIELD_SLUG] || "").toString().trim();
+
+      const baseLabel =
+        fd.name ||
+        fd.title ||
+        fd.slug ||
+        refItem.id ||
+        '';
+
+      if (!rawVal) {
+        console.log('⏭️ Skipping (no scope set)', {
+          id: refItem.id,
+          label: baseLabel,
+          rawVal
+        });
+        return false; // strict: require scope
+      }
+
+      // If the field is an Option, `rawVal` is usually the option id/slug,
+      // so translate it back to its display name if we can:
+      let scopeName = rawVal;
+      if (optionMapById && optionMapById[rawVal]) {
+        scopeName = optionMapById[rawVal];
+      }
+
+      const normalizedScope = scopeName.trim().toLowerCase();
+      const passes = normalizedScope === currentScope;
+
+      console.log('🔍 Scope check', {
+        id: refItem.id,
+        label: baseLabel,
+        rawVal,
+        scopeName,
+        normalizedScope,
+        currentScope,
+        passes
+      });
+
+      return passes;
+    });
+  } else {
+    console.log('No scopeField defined – using all items');
+  }
+
+  console.log('filteredItems length', filteredItems.length);
+
+  // --- Sort options alphabetically by visible label ---
+  filteredItems.sort((a, b) => {
+    const fa = a.fieldData || {};
+    const fb = b.fieldData || {};
+    const labelA = (fa.name || fa.title || fa.slug || a.id || "").toString();
+    const labelB = (fb.name || fb.title || fb.slug || b.id || "").toString();
+    return labelA.localeCompare(labelB, 'nb-NO', { sensitivity: 'base' });
+  });
+
+  // --- Build <select> options from filtered items ---
+  selectEl.innerHTML = "";
+
+  if (!multiple) {
+    const noneOpt = el("option", { value: "" }, [
+      document.createTextNode("Ingen")
+    ]);
+    selectEl.appendChild(noneOpt);
+  }
+
+  filteredItems.forEach(refItem => {
+    const id = refItem.id;
+    const fd = refItem.fieldData || {};
+    const label =
+      fd.name ||
+      fd.title ||
+      fd.slug ||
+      refItem.id;
+
+    const opt = el("option", { value: id }, [
+      document.createTextNode(label)
+    ]);
+    if (selectedIds.includes(id)) opt.selected = true;
+    selectEl.appendChild(opt);
+  });
+
+  console.log('Final select options count', selectEl.options.length);
+
+  // --- MultiReference "chips" UI (same as before) ---
+  if (!multiple || !ui || !ui.optionsHost || !ui.chipsHost) {
+    console.groupEnd();
+    return;
+  }
+
+  const optionsHost = ui.optionsHost;
+  const chipsHost   = ui.chipsHost;
+
+  function renderOptions(){
+    optionsHost.innerHTML = "";
+    Array.from(selectEl.options).forEach(opt => {
+      if (opt.disabled) return;
+      const btn = el("button", {
+        type: "button",
+        class: "cms-mref-option" + (opt.selected ? " cms-mref-option--selected" : "")
+      }, [ document.createTextNode(opt.textContent || opt.value) ]);
+
+      btn.addEventListener("click", () => {
+        opt.selected = !opt.selected;
+        renderOptions();
+        renderChips();
+      });
+
+      optionsHost.appendChild(btn);
+    });
+  }
+
+  function renderChips(){
+    chipsHost.innerHTML = "";
+    Array.from(selectEl.options)
+      .filter(opt => opt.selected && opt.value)
+      .forEach(opt => {
+        const chip = el("div", { class: "cms-mref-chip" }, [
+          el("span", { class: "cms-mref-chip-label" }, [
+            document.createTextNode(opt.textContent || opt.value)
+          ]),
+          el("button", {
+            type: "button",
+            class: "cms-mref-chip-remove"
+          }, [ document.createTextNode("×") ])
+        ]);
+
+        chip.querySelector(".cms-mref-chip-remove").addEventListener("click", () => {
+          opt.selected = false;
+          renderOptions();
+          renderChips();
+        });
+
+        chipsHost.appendChild(chip);
+      });
+  }
+
+  renderOptions();
+  renderChips();
+
+  console.groupEnd();
+}
+
+
+function syncSortHeaderUI() {
+  const header = document.getElementById('items-header');
+  if (!header) return;
+
+  header.querySelectorAll('.items-header-cell--sortable').forEach(cell => {
+    const key = cell.getAttribute('data-sort-key');
+    if (key === state.sortKey) {
+      cell.setAttribute('data-sort-dir', state.sortDir); // "asc" or "desc"
+    } else {
+      cell.removeAttribute('data-sort-dir');
+    }
+  });
+}
+
+
+
+
+async function initEditor(){
+  try{
+    const collectionId=getCollectionIdFromAttribute();
+    if(!collectionId){
+      setStatus('Mangler collection-id på #collection-id',true);
+      return;
+    }
+
+    state.collectionId=collectionId;
+
+    setStatus('Laster inn samling…');
+
+        const details = await apiGetCollectionDetails(state.collectionId);
+    state.collectionDetails = details;
+    state.fieldsBySlug = {};
+    (details.fields || []).forEach(f => {
+      state.fieldsBySlug[f.slug] = f;
+    });
+
+    loadEditorPrefs();
+
+    setStatus('Laster inn elementer…');
+
+    const data=await apiGetItems(state.collectionId);
+    state.items=data.items||[];
+
+    state.selectedItemIds.clear();
+    state.currentItem=null;
+    state.isNew=false;
+
+    // 🔥 NEW: warm reference caches before first render,
+    // so pinned ref fields can show labels instead of IDs immediately
+    await warmAllRefCaches();
+
+    setupPinnedFieldsControl();
+    renderItemsHeader();
+
+    syncSortHeaderUI();
+    renderItemsList();
+    renderItemForm(null);
+    setStatus('Klar');
+    closeEditor();
+    updateEditorButtons();
+     saveEditorPrefs();
+  }catch(err){
+    console.error(err);
+    setStatus('Kunne ikke initialisere editor',true);
+  }
+}
+
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const form                 = qs('#item-form');
+  const deleteBtn            = qs('#delete-item-btn');
+  const newItemBtn           = qs('#new-item-btn');
+  const publishItemBtn       = qs('#publish-item-btn');
+  const unpublishItemBtn     = qs('#unpublish-item-btn');
+  const publishSelectedBtn   = qs('#publish-selected-btn');
+  const unpublishSelectedBtn = qs('#unpublish-selected-btn');
+  const selectAll            = qs('#select-all-items');
+  const closeItemBtn         = qs('#close-item-btn');
+  const saveItemBtn          = qs('#save-item-btn');
+  const searchInput          = qs('#items-search');
+  const filterStatus         = qs('#items-filter-status');
+  const sortSelect           = qs('#items-sort');
+
+  if (form)               form.addEventListener('submit', handleSave);
+  if (deleteBtn)          deleteBtn.addEventListener('click', handleDelete);
+  if (newItemBtn)         newItemBtn.addEventListener('click', handleNewItem);
+  if (publishItemBtn)     publishItemBtn.addEventListener('click', handlePublishItem);
+  if (unpublishItemBtn)   unpublishItemBtn.addEventListener('click', handleUnpublishItem);
+  if (publishSelectedBtn) publishSelectedBtn.addEventListener('click', handlePublishSelected);
+  if (unpublishSelectedBtn) unpublishSelectedBtn.addEventListener('click', handleUnpublishSelected);
+  if (selectAll)          selectAll.addEventListener('change', handleSelectAllChange);
+  if (closeItemBtn)       closeItemBtn.addEventListener('click', handleCloseItem);
+  if (saveItemBtn)        saveItemBtn.addEventListener('click', handleSave);
+
+  const deleteSelectedBtn = qs('#delete-selected-btn');
+if (deleteSelectedBtn) {
+  deleteSelectedBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    handleDeleteSelected();
+  });
+}
+
+
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      state.searchQuery = searchInput.value;
+      renderItemsList();
+    });
+  }
+
+  if (filterStatus) {
+    filterStatus.addEventListener('change', () => {
+      state.statusFilter = filterStatus.value || 'all';
+      renderItemsList();
+    });
+  }
+
+  if (sortSelect) {
+    sortSelect.addEventListener('change', () => {
+      const val = sortSelect.value || 'name-asc';
+      const [key, dir] = val.split('-');
+      state.sortKey = key || 'name';
+      state.sortDir = dir || 'asc';
+      renderItemsList();
+    });
+  }
+
+  const btn           = document.getElementById('editor-btn');
+  const section       = document.getElementById('editor-section');
+  const accordionIcon = document.getElementById('accordion-ikon');
+
+  if (btn && section) {
+    btn.addEventListener('click', () => {
+      section.classList.toggle('closed');
+      if (accordionIcon) accordionIcon.classList.toggle('clicked');
+    });
+  }
+
+  initEditor();
+});
+</script>
