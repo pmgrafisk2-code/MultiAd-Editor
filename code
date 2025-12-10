@@ -1192,43 +1192,6 @@ function renderItemsHeader() {
 }
 
 
-function askConfirm(message) {
-  return new Promise((resolve) => {
-    const box = qs("#confirm-message");
-    const txt = qs("#confirm-txt");
-    const btnYes = qs("#confirm-yes");
-    const btnNo = qs("#confirm-no");
-
-    if (!box || !txt || !btnYes || !btnNo) {
-      console.warn("Custom confirm elements missing, falling back to browser confirm()");
-      resolve(confirm(message));
-      return;
-    }
-    txt.textContent = message;
-
-    box.classList.remove("hidden");
-
-    function cleanup() {
-      btnYes.removeEventListener("click", onYes);
-      btnNo.removeEventListener("click", onNo);
-      box.classList.add("hidden");
-    }
-
-    function onYes() {
-      cleanup();
-      resolve(true);
-    }
-
-    function onNo() {
-      cleanup();
-      resolve(false);
-    }
-
-    btnYes.addEventListener("click", onYes);
-    btnNo.addEventListener("click", onNo);
-  });
-}
-
 
 
 function resolveReferenceLabel(field, raw) {
